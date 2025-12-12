@@ -1,0 +1,5 @@
+{
+  "name": "JobScout AI",
+  "description": "AI-powered job scraper and analyzer that parses your CV, scrapes LinkedIn jobs via Apify, scores them for relevance, and generates tailored cover letters.",
+  "requestFramePermissions": []
+}

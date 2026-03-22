@@ -16,19 +16,33 @@ dotenv.config();
 
 // --- Configuration ---
 const PORT = 3000;
-const PDF_TTL_SECONDS = parseInt(process.env.PDF_TTL_SECONDS || '3600');
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 const TEMP_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'temp');
+
+const ALLOWED_MIME_TYPES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
 // --- Setup ---
 const app = express();
-const upload = multer({ dest: TEMP_DIR });
+const upload = multer({
+  dest: TEMP_DIR,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type "${file.mimetype}". Please upload a PDF or DOCX.`));
+    }
+  },
+});
 
-app.use(cors() as any);
+app.use(cors({ origin: ALLOWED_ORIGIN }) as any);
 app.use(express.json() as any);
-// Serve temp files for download (Secure this in production with signed URLs or auth)
-app.use('/download', express.static(TEMP_DIR) as any);
 
 // --- GenAI Client ---
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -91,14 +105,12 @@ async function extractText(filePath: string, mimeType: string): Promise<string> 
 async function scrapeLinkedInJobs(
   searchUrl: string,
   maxItems: number,
-  jobId: string,
-  apiToken?: string,
-  actorSlug?: string
+  jobId: string
 ): Promise<any[]> {
-  const token = apiToken || process.env.APIFY_API_TOKEN;
-  const actor = actorSlug || process.env.APIFY_ACTOR_SLUG || "curious_coder~linkedin-jobs-scraper";
+  const token = process.env.APIFY_API_TOKEN;
+  const actor = process.env.APIFY_ACTOR_SLUG || "curious_coder~linkedin-jobs-scraper";
 
-  if (!token) throw new Error("Missing Apify API Token. Provide it in the UI settings or .env (APIFY_API_TOKEN).");
+  if (!token) throw new Error("Missing Apify API Token. Set APIFY_API_TOKEN in your .env file.");
 
   console.log(`Starting Apify actor ${actor} for ${searchUrl}`);
   emitProgress(jobId, { type: 'progress', message: 'Starting LinkedIn job scraper...', percent: 15 });
@@ -330,7 +342,7 @@ app.get('/api/progress/:jobId', (req: any, res: any) => {
 // Analyze endpoint — returns jobId immediately, processes in background
 app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: any) => {
   const file = req.file;
-  const { searchUrl, maxJobs, scoreThreshold, apifyToken, apifyActor } = req.body;
+  const { searchUrl, maxJobs, scoreThreshold } = req.body;
 
   if (!file) return res.status(400).json({ error: "No CV file uploaded." });
 
@@ -349,9 +361,7 @@ app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: a
       const rawJobs = await scrapeLinkedInJobs(
         searchUrl,
         parseInt(maxJobs) || 50,
-        jobId,
-        apifyToken,
-        apifyActor
+        jobId
       );
       const normalizedJobs = rawJobs.map(normalizeJobData);
       emitProgress(jobId, { type: 'progress', message: `Found ${normalizedJobs.length} jobs. Starting AI analysis...`, percent: 45 });
@@ -436,17 +446,13 @@ app.post('/api/generate-cover', async (req: any, res: any) => {
 
     await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
 
-    const fileName = `cover-letter-${uuidv4()}.pdf`;
-    const filePath = path.join(TEMP_DIR, fileName);
-    await page.pdf({ path: filePath, format: 'A4', margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' } });
+    const pdfBuffer = await page.pdf({ format: 'A4', margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' } });
     await browser.close();
 
-    // Schedule cleanup after TTL
-    setTimeout(() => {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    }, PDF_TTL_SECONDS * 1000);
-
-    res.json({ coverLetterUrl: `/download/${fileName}`, coverLetterText });
+    const safeCompany = job.companyName.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="cover-letter-${safeCompany}.pdf"`);
+    res.send(Buffer.from(pdfBuffer));
 
   } catch (error: any) {
     console.error("Cover letter generation failed:", error);

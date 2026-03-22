@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Upload, Search, FileText, Briefcase, AlertCircle, Loader2, Download, ExternalLink, RefreshCw, Settings, ChevronDown, User } from 'lucide-react';
+import { Upload, Search, FileText, Briefcase, AlertCircle, Loader2, Download, ExternalLink, RefreshCw, ChevronDown, User } from 'lucide-react';
 import { AnalyzedResponse, Job } from './types';
 
 // API Base URL - assumes the Node server is running on port 3000
@@ -13,12 +13,6 @@ const App: React.FC = () => {
   const [maxJobs, setMaxJobs] = useState<number>(50);
   const [scoreThreshold, setScoreThreshold] = useState<number>(60);
   
-  // Scraper Settings (Apify)
-  // Changed default to true so users see where to paste keys immediately
-  const [showScraperSettings, setShowScraperSettings] = useState<boolean>(true);
-  const [apifyToken, setApifyToken] = useState<string>('');
-  const [apifyActor, setApifyActor] = useState<string>('curious_coder~linkedin-jobs-scraper');
-
   // App Status State
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'success' | 'error'>('idle');
   const [loadingMessage, setLoadingMessage] = useState<string>('');
@@ -63,10 +57,6 @@ const App: React.FC = () => {
     formData.append('searchUrl', searchUrl);
     formData.append('maxJobs', maxJobs.toString());
     formData.append('scoreThreshold', scoreThreshold.toString());
-
-    // Pass optional scraper settings
-    formData.append('apifyToken', apifyToken);
-    formData.append('apifyActor', apifyActor);
 
     try {
       // Step 1: Submit job, get jobId
@@ -142,12 +132,13 @@ const App: React.FC = () => {
         throw new Error("Failed to generate cover letter");
       }
 
-      const result = await response.json();
-      
-      // Trigger download
-      if (result.coverLetterUrl) {
-        window.open(result.coverLetterUrl, '_blank');
-      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cover-letter-${job.companyName.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
     } catch (err) {
       alert("Failed to generate cover letter. Please try again.");
     } finally {
@@ -297,44 +288,6 @@ const App: React.FC = () => {
                   placeholder="e.g. Jane Smith"
                   className="w-full md:w-80 rounded-lg border-gray-300 border p-2.5 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none bg-white text-gray-900"
                 />
-              </div>
-
-              {/* Scraper Settings Section */}
-              <div className="border-t border-gray-100 pt-4">
-                 <button 
-                   type="button"
-                   onClick={() => setShowScraperSettings(!showScraperSettings)}
-                   className="flex items-center gap-2 text-sm font-medium text-gray-600 hover:text-blue-600 transition-colors mb-4"
-                 >
-                   <Settings className="w-4 h-4" />
-                   {showScraperSettings ? 'Hide Scraper Settings' : 'Scraper Settings (Apify)'}
-                 </button>
-                 
-                 {showScraperSettings && (
-                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-gray-50 rounded-lg border border-gray-200 animate-fade-in">
-                     <div>
-                       <label className="block text-sm font-medium text-gray-700 mb-1">Apify API Token</label>
-                       <input 
-                         type="password"
-                         value={apifyToken}
-                         onChange={(e) => setApifyToken(e.target.value)}
-                         placeholder="Paste your Apify API Token here"
-                         className="w-full rounded-lg border-gray-300 border p-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white text-gray-900"
-                       />
-                       <p className="text-xs text-gray-400 mt-1">Leave blank if using .env file</p>
-                     </div>
-                     <div>
-                       <label className="block text-sm font-medium text-gray-700 mb-1">Actor Slug</label>
-                       <input 
-                         type="text"
-                         value={apifyActor}
-                         onChange={(e) => setApifyActor(e.target.value)}
-                         placeholder="curious_coder~linkedin-jobs-scraper"
-                         className="w-full rounded-lg border-gray-300 border p-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white text-gray-900"
-                       />
-                     </div>
-                   </div>
-                 )}
               </div>
 
               {/* Action */}

@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Upload, Search, FileText, Briefcase, CheckCircle, AlertCircle, Loader2, Download, ExternalLink, RefreshCw, Settings } from 'lucide-react';
+import { Upload, Search, FileText, Briefcase, AlertCircle, Loader2, Download, ExternalLink, RefreshCw, Settings, ChevronDown, User } from 'lucide-react';
 import { AnalyzedResponse, Job } from './types';
 
 // API Base URL - assumes the Node server is running on port 3000
@@ -8,6 +8,7 @@ const API_BASE_URL = 'http://localhost:3000/api';
 const App: React.FC = () => {
   // Form State
   const [cvFile, setCvFile] = useState<File | null>(null);
+  const [applicantName, setApplicantName] = useState<string>('');
   const [searchUrl, setSearchUrl] = useState<string>('');
   const [maxJobs, setMaxJobs] = useState<number>(50);
   const [scoreThreshold, setScoreThreshold] = useState<number>(60);
@@ -29,6 +30,9 @@ const App: React.FC = () => {
   
   // Cover Letter Generation State
   const [generatingCoverId, setGeneratingCoverId] = useState<string | null>(null);
+
+  // Expanded job description state
+  const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -126,6 +130,7 @@ const App: React.FC = () => {
         },
         body: JSON.stringify({
           job,
+          applicantName: applicantName.trim() || 'The Applicant',
           cvContext: {
             skills: data?.skills,
             experienceHighlights: data?.experienceHighlights
@@ -156,6 +161,30 @@ const App: React.FC = () => {
     setErrorMessage('');
     setLoadingMessage('');
     setLoadingPercent(0);
+    setExpandedJobId(null);
+  };
+
+  const downloadCSV = () => {
+    if (!data) return;
+    const headers = ['Title', 'Company', 'Score', 'Verdict', 'Job URL', 'Apply URL', 'Date'];
+    const rows = data.jobs.map(job => [
+      job.jobTitle,
+      job.companyName,
+      job.score ?? '',
+      job.verdict ?? '',
+      job.jobUrl,
+      job.applyUrl ?? '',
+      job.scrapedAt,
+    ]);
+    const escape = (val: string | number) => `"${String(val).replace(/"/g, '""')}"`;
+    const csv = [headers, ...rows].map(row => row.map(escape).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'jobscout-results.csv';
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -253,6 +282,21 @@ const App: React.FC = () => {
                       </div>
                    </div>
                 </div>
+              </div>
+
+              {/* Applicant Name */}
+              <div className="border-t border-gray-100 pt-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center gap-1.5">
+                  <User className="w-4 h-4 text-gray-400" />
+                  Your Name <span className="text-gray-400 font-normal">(used in cover letters)</span>
+                </label>
+                <input
+                  type="text"
+                  value={applicantName}
+                  onChange={(e) => setApplicantName(e.target.value)}
+                  placeholder="e.g. Jane Smith"
+                  className="w-full md:w-80 rounded-lg border-gray-300 border p-2.5 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none bg-white text-gray-900"
+                />
               </div>
 
               {/* Scraper Settings Section */}
@@ -381,8 +425,17 @@ const App: React.FC = () => {
                 <h3 className="text-xl font-bold text-gray-900">
                   Matched Jobs <span className="text-gray-400 font-normal ml-2">({data.jobs.length})</span>
                 </h3>
-                <div className="text-sm text-gray-500">
-                  Showing jobs with score &ge; {scoreThreshold}
+                <div className="flex items-center gap-4">
+                  <span className="text-sm text-gray-500">Score &ge; {scoreThreshold}</span>
+                  {data.jobs.length > 0 && (
+                    <button
+                      onClick={downloadCSV}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                    >
+                      <Download className="w-4 h-4" />
+                      Export CSV
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -431,7 +484,25 @@ const App: React.FC = () => {
                                 {job.verdict}
                               </p>
                             </div>
-                            
+
+                            {job.description && (
+                              <div>
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedJobId(expandedJobId === job.jobId ? null : job.jobId)}
+                                  className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-blue-600 transition-colors"
+                                >
+                                  <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${expandedJobId === job.jobId ? 'rotate-180' : ''}`} />
+                                  {expandedJobId === job.jobId ? 'Hide description' : 'Show description'}
+                                </button>
+                                {expandedJobId === job.jobId && (
+                                  <div className="mt-2 max-h-64 overflow-y-auto rounded-lg border border-gray-200 bg-gray-50 p-4">
+                                    <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">{job.description}</p>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
                             <div className="flex items-center gap-4 text-xs text-gray-400 pt-2">
                               <span>Scraped: {job.scrapedAt}</span>
                               {job.jobId && <span>ID: {job.jobId}</span>}

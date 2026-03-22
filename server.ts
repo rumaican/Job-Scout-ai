@@ -379,7 +379,8 @@ app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: a
 });
 
 app.post('/api/generate-cover', async (req: any, res: any) => {
-  const { job, cvContext } = req.body;
+  const { job, cvContext, applicantName } = req.body;
+  const name = (applicantName || 'The Applicant').trim();
 
   try {
     const prompt = `
@@ -388,6 +389,7 @@ app.post('/api/generate-cover', async (req: any, res: any) => {
       JOB: ${job.jobTitle} at ${job.companyName}
       JOB CONTEXT: ${job.description.substring(0, 1000)}
 
+      APPLICANT NAME: ${name}
       APPLICANT SKILLS: ${(cvContext?.skills || []).join(', ')}
       APPLICANT EXPERIENCE: ${(cvContext?.experienceHighlights || []).join('; ')}
 
@@ -397,7 +399,8 @@ app.post('/api/generate-cover', async (req: any, res: any) => {
       2. Relevance (skills match).
       3. Call to Action.
 
-      Do not include placeholders like [Your Name] - use "The Applicant".
+      Sign the letter with the applicant's name: ${name}.
+      Do not use placeholder brackets like [Your Name].
     `;
 
     const response = await ai.models.generateContent({

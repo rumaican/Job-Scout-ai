@@ -8,7 +8,7 @@ import pdfParse from 'pdf-parse';
 import * as mammoth from 'mammoth';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from "@google/genai";
-import puppeteer from 'puppeteer';
+import PDFDocument from 'pdfkit';
 import { v4 as uuidv4 } from 'uuid';
 import fetch from 'node-fetch';
 
@@ -18,6 +18,7 @@ dotenv.config();
 const PORT = 3000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 const TEMP_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'temp');
+const CV_CHAR_LIMIT = 50000; // ~10× the old limit; warn if exceeded
 
 const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
@@ -58,6 +59,7 @@ type ProgressEvent = {
 type JobState = {
   listeners: Array<(event: ProgressEvent) => void>;
   done: boolean;
+  cvText?: string; // retained for cover letter generation
 };
 
 const jobStore = new Map<string, JobState>();
@@ -101,7 +103,7 @@ async function extractText(filePath: string, mimeType: string): Promise<string> 
   }
 }
 
-// 2. Apify Interaction
+// 2. Apify Interaction — wall-clock timeout via MAX_POLLS (5 min @ 5s/poll)
 async function scrapeLinkedInJobs(
   searchUrl: string,
   maxItems: number,
@@ -115,7 +117,6 @@ async function scrapeLinkedInJobs(
   console.log(`Starting Apify actor ${actor} for ${searchUrl}`);
   emitProgress(jobId, { type: 'progress', message: 'Starting LinkedIn job scraper...', percent: 15 });
 
-  // Start the run
   const startRes = await fetch(`https://api.apify.com/v2/acts/${actor}/runs?token=${token}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -136,12 +137,12 @@ async function scrapeLinkedInJobs(
   const defaultDatasetId = runData.data.defaultDatasetId;
 
   console.log(`Apify run started: ${runId}, polling for completion...`);
-  emitProgress(jobId, { type: 'progress', message: `Scraper started (run ${runId}). Waiting for results...`, percent: 20 });
+  emitProgress(jobId, { type: 'progress', message: `Scraper started. Waiting for results...`, percent: 20 });
 
-  // Poll for completion — percent climbs from 20 → 42 during polling
+  // Poll — percent climbs 20 → 42 over MAX_POLLS; throws on timeout
   let status = 'RUNNING';
   let pollCount = 0;
-  const MAX_POLLS = 60; // 5 minutes max (60 × 5s)
+  const MAX_POLLS = 60; // 5-minute wall-clock cap (60 × 5s)
 
   while ((status === 'RUNNING' || status === 'READY') && pollCount < MAX_POLLS) {
     await new Promise(r => setTimeout(r, 5000));
@@ -163,14 +164,12 @@ async function scrapeLinkedInJobs(
   if (pollCount >= MAX_POLLS && status !== 'SUCCEEDED') {
     throw new Error('Scraper timed out after 5 minutes.');
   }
-
   if (status !== 'SUCCEEDED') {
     throw new Error(`Apify run failed with status: ${status}`);
   }
 
   emitProgress(jobId, { type: 'progress', message: 'Scraping complete. Fetching results...', percent: 43 });
 
-  // Fetch items
   const itemsRes = await fetch(`https://api.apify.com/v2/datasets/${defaultDatasetId}/items?token=${token}&limit=100`);
   const items = await itemsRes.json() as any[];
   return items;
@@ -192,9 +191,20 @@ function normalizeJobData(rawJob: any): any {
 
 // 4. Gemini Analysis
 async function analyzeCvAndJobs(cvText: string, jobs: any[], threshold: number, jobId: string) {
-  // A. Parse CV
+  // A. Parse CV — warn if truncated
+  const truncated = cvText.length > CV_CHAR_LIMIT;
+  const cvTextForAnalysis = truncated ? cvText.substring(0, CV_CHAR_LIMIT) : cvText;
+
+  if (truncated) {
+    emitProgress(jobId, {
+      type: 'progress',
+      message: `Note: CV is large (${cvText.length.toLocaleString()} chars). Analysing the first 50,000 characters.`,
+      percent: 47
+    });
+  }
+
   console.log("Parsing CV with Gemini...");
-  emitProgress(jobId, { type: 'progress', message: 'Analysing your CV with AI...', percent: 47 });
+  emitProgress(jobId, { type: 'progress', message: 'Analysing your CV with AI...', percent: truncated ? 49 : 47 });
 
   const cvPrompt = `
     Extract the following from this CV text:
@@ -203,7 +213,7 @@ async function analyzeCvAndJobs(cvText: string, jobs: any[], threshold: number, 
     3. Three key experience highlights (array of strings).
 
     CV TEXT:
-    ${cvText.substring(0, 10000)}
+    ${cvTextForAnalysis}
   `;
 
   const cvResponse = await ai.models.generateContent({
@@ -225,83 +235,122 @@ async function analyzeCvAndJobs(cvText: string, jobs: any[], threshold: number, 
   const cvData = JSON.parse(cvResponse.text);
   emitProgress(jobId, { type: 'progress', message: `CV analysed. Found ${cvData.skills.length} skills. Now scoring ${jobs.length} jobs...`, percent: 55 });
 
-  // B. Score Jobs in chunks of 5 with concurrency
-  console.log(`Scoring ${jobs.length} jobs...`);
+  // B. Batch score jobs — 10 per Gemini call (vs. 1 per call before)
+  // 100 jobs = 10 API calls instead of 100
+  console.log(`Scoring ${jobs.length} jobs in batches of 10...`);
 
   const scoredJobs: any[] = [];
-  const chunkSize = 5;
-  const totalChunks = Math.ceil(jobs.length / chunkSize);
+  const BATCH_SIZE = 10;
+  const totalBatches = Math.ceil(jobs.length / BATCH_SIZE);
 
-  const createScoringPrompt = (job: any) => `
-    You are a recruiter. Compare this candidate's profile to the job description.
-
-    CANDIDATE SKILLS: ${JSON.stringify(cvData.skills)}
-    CANDIDATE SUMMARY: ${cvData.profileSummary}
-
-    JOB TITLE: ${job.jobTitle}
-    JOB DESCRIPTION: ${job.description.substring(0, 3000)}
-
-    Rubric:
-    - 90-100: Perfect match (skills, seniority, industry).
-    - 70-89: Good match (missing minor skills).
-    - 50-69: Potential match (transferable skills).
-    - <50: Poor match.
-
-    Return JSON:
-    {
-      "score": number (0-100),
-      "verdict": string (2-4 sentences explaining the score)
-    }
-  `;
-
-  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-    const chunk = jobs.slice(chunkIndex * chunkSize, (chunkIndex + 1) * chunkSize);
-    const jobsProcessed = chunkIndex * chunkSize;
-    const jobsRemaining = jobs.length - jobsProcessed;
+  for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+    const batch = jobs.slice(batchIndex * BATCH_SIZE, (batchIndex + 1) * BATCH_SIZE);
+    const jobsProcessed = batchIndex * BATCH_SIZE;
 
     // Scoring progress: 55% → 92%
-    const scorePercent = Math.round(55 + ((chunkIndex / totalChunks) * 37));
+    const scorePercent = Math.round(55 + (batchIndex / totalBatches) * 37);
     emitProgress(jobId, {
       type: 'progress',
-      message: `Scoring jobs ${jobsProcessed + 1}–${Math.min(jobsProcessed + chunkSize, jobs.length)} of ${jobs.length}...`,
+      message: `Scoring jobs ${jobsProcessed + 1}–${Math.min(jobsProcessed + BATCH_SIZE, jobs.length)} of ${jobs.length}...`,
       percent: scorePercent
     });
 
-    const promises = chunk.map(async (job: any) => {
-      try {
-        const resp = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: createScoringPrompt(job),
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
+    const batchPrompt = `
+      You are a recruiter scoring job listings against a candidate profile.
+
+      CANDIDATE SKILLS: ${JSON.stringify(cvData.skills)}
+      CANDIDATE SUMMARY: ${cvData.profileSummary}
+
+      Score each of the following ${batch.length} jobs. Return a JSON array with one entry per job,
+      in the same order as the input.
+
+      Rubric:
+      - 90-100: Perfect match (skills, seniority, industry).
+      - 70-89: Good match (missing minor skills).
+      - 50-69: Potential match (transferable skills).
+      - <50: Poor match.
+
+      JOBS:
+      ${JSON.stringify(batch.map(j => ({
+        jobId: j.jobId,
+        jobTitle: j.jobTitle,
+        description: j.description.substring(0, 1500)
+      })))}
+    `;
+
+    try {
+      const resp = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: batchPrompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
+                jobId: { type: Type.STRING },
                 score: { type: Type.NUMBER },
                 verdict: { type: Type.STRING }
               }
             }
           }
-        });
-        const result = JSON.parse(resp.text);
-        if (result.score >= threshold) {
-          return { ...job, ...result };
         }
-        return null;
-      } catch (e) {
-        console.error(`Failed to score job ${job.jobId}`, e);
-        return null;
-      }
-    });
+      });
 
-    const results = await Promise.all(promises);
-    scoredJobs.push(...results.filter(r => r !== null));
+      const results: Array<{ jobId: string; score: number; verdict: string }> = JSON.parse(resp.text);
+
+      for (const result of results) {
+        const original = batch.find(j => j.jobId === result.jobId);
+        if (original && result.score >= threshold) {
+          scoredJobs.push({ ...original, score: result.score, verdict: result.verdict });
+        }
+      }
+    } catch (e) {
+      console.error(`Failed to score batch ${batchIndex + 1}`, e);
+      // Skip failed batch rather than aborting the whole run
+    }
   }
 
   return {
     ...cvData,
     jobs: scoredJobs.sort((a, b) => b.score - a.score)
   };
+}
+
+// 5. PDF Generation using pdfkit (replaces puppeteer / headless Chromium)
+function generateCoverLetterPDF(
+  coverLetterText: string,
+  jobTitle: string,
+  companyName: string
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 60, size: 'A4' });
+    const chunks: Buffer[] = [];
+
+    doc.on('data', chunk => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    // Header
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#111').text(`Application for ${jobTitle}`);
+    doc.fontSize(11).font('Helvetica').fillColor('#555').text(companyName);
+    doc.moveDown(0.4);
+    doc.moveTo(60, doc.y).lineTo(535, doc.y).strokeColor('#dddddd').stroke();
+    doc.moveDown(1.5);
+
+    // Body
+    doc.fillColor('#333');
+    for (const line of coverLetterText.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        doc.fontSize(11).font('Helvetica').text(trimmed, { align: 'justify', lineGap: 3 });
+        doc.moveDown(0.6);
+      }
+    }
+
+    doc.end();
+  });
 }
 
 // --- Endpoints ---
@@ -318,7 +367,6 @@ app.get('/api/progress/:jobId', (req: any, res: any) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  // If already done (client reconnected after completion), nothing to stream
   if (job.done) {
     res.end();
     return;
@@ -352,17 +400,19 @@ app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: a
   // Background processing
   (async () => {
     try {
-      // Step 1: Extract CV text
+      // Step 1: Extract CV text and cache it for cover letter generation
       emitProgress(jobId, { type: 'progress', message: 'Extracting text from your CV...', percent: 5 });
       const cvText = await extractText(file.path, file.mimetype);
+      fs.unlinkSync(file.path);
+
+      // Store full CV text in the job state so /generate-cover can use it
+      const state = jobStore.get(jobId);
+      if (state) state.cvText = cvText;
+
       emitProgress(jobId, { type: 'progress', message: 'CV text extracted successfully.', percent: 10 });
 
       // Step 2: Scrape jobs
-      const rawJobs = await scrapeLinkedInJobs(
-        searchUrl,
-        parseInt(maxJobs) || 50,
-        jobId
-      );
+      const rawJobs = await scrapeLinkedInJobs(searchUrl, parseInt(maxJobs) || 50, jobId);
       const normalizedJobs = rawJobs.map(normalizeJobData);
       emitProgress(jobId, { type: 'progress', message: `Found ${normalizedJobs.length} jobs. Starting AI analysis...`, percent: 45 });
 
@@ -373,9 +423,6 @@ app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: a
         parseInt(scoreThreshold) || 60,
         jobId
       );
-
-      // Cleanup input file
-      fs.unlinkSync(file.path);
 
       emitProgress(jobId, { type: 'progress', message: `Done! Found ${analysisResult.jobs.length} matching jobs.`, percent: 100 });
       emitProgress(jobId, { type: 'result', data: analysisResult });
@@ -388,20 +435,26 @@ app.post('/api/analyze', upload.single('cvFile') as any, async (req: any, res: a
   })();
 });
 
+// Cover letter endpoint — retrieves cached CV text via jobId for a richer prompt
 app.post('/api/generate-cover', async (req: any, res: any) => {
-  const { job, cvContext, applicantName } = req.body;
+  const { job, cvContext, applicantName, jobId } = req.body;
   const name = (applicantName || 'The Applicant').trim();
+
+  // Pull full CV text from the session store if still available
+  const state = jobId ? jobStore.get(jobId) : null;
+  const fullCvText = state?.cvText ? state.cvText.substring(0, 8000) : '';
 
   try {
     const prompt = `
       Write a professional cover letter for the following job application.
 
       JOB: ${job.jobTitle} at ${job.companyName}
-      JOB CONTEXT: ${job.description.substring(0, 1000)}
+      JOB DESCRIPTION: ${job.description.substring(0, 1500)}
 
       APPLICANT NAME: ${name}
       APPLICANT SKILLS: ${(cvContext?.skills || []).join(', ')}
-      APPLICANT EXPERIENCE: ${(cvContext?.experienceHighlights || []).join('; ')}
+      APPLICANT EXPERIENCE HIGHLIGHTS: ${(cvContext?.experienceHighlights || []).join('; ')}
+      ${fullCvText ? `\n      FULL CV CONTEXT:\n      ${fullCvText}` : ''}
 
       Tone: Professional, concise, enthusiastic. Max 300 words.
       Structure:
@@ -419,40 +472,12 @@ app.post('/api/generate-cover', async (req: any, res: any) => {
     });
 
     const coverLetterText = response.text;
-
-    // Generate PDF
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
-    const page = await browser.newPage();
-
-    const htmlContent = `
-      <html>
-        <head>
-          <style>
-            body { font-family: Helvetica, Arial, sans-serif; line-height: 1.6; padding: 40px; color: #333; }
-            h1 { font-size: 18px; margin-bottom: 20px; }
-            p { margin-bottom: 15px; }
-            .header { margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 20px; }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <strong>Application for ${job.jobTitle}</strong><br/>
-            ${job.companyName}
-          </div>
-          ${coverLetterText.split('\n').map((p: string) => p.trim() ? `<p>${p}</p>` : '').join('')}
-        </body>
-      </html>
-    `;
-
-    await page.setContent(htmlContent, { waitUntil: 'networkidle0' });
-
-    const pdfBuffer = await page.pdf({ format: 'A4', margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' } });
-    await browser.close();
+    const pdfBuffer = await generateCoverLetterPDF(coverLetterText, job.jobTitle, job.companyName);
 
     const safeCompany = job.companyName.replace(/[^a-z0-9]/gi, '-').toLowerCase();
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="cover-letter-${safeCompany}.pdf"`);
-    res.send(Buffer.from(pdfBuffer));
+    res.send(pdfBuffer);
 
   } catch (error: any) {
     console.error("Cover letter generation failed:", error);

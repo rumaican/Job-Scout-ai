@@ -21,7 +21,8 @@ const App: React.FC = () => {
   
   // Data State
   const [data, setData] = useState<AnalyzedResponse | null>(null);
-  
+  const [analysisJobId, setAnalysisJobId] = useState<string | null>(null);
+
   // Cover Letter Generation State
   const [generatingCoverId, setGeneratingCoverId] = useState<string | null>(null);
 
@@ -71,6 +72,7 @@ const App: React.FC = () => {
       }
 
       const { jobId } = await response.json();
+      setAnalysisJobId(jobId);
 
       // Step 2: Open SSE stream for real-time progress
       await new Promise<void>((resolve, reject) => {
@@ -121,6 +123,7 @@ const App: React.FC = () => {
         body: JSON.stringify({
           job,
           applicantName: applicantName.trim() || 'The Applicant',
+          jobId: analysisJobId,
           cvContext: {
             skills: data?.skills,
             experienceHighlights: data?.experienceHighlights
@@ -149,6 +152,7 @@ const App: React.FC = () => {
   const reset = () => {
     setStatus('idle');
     setData(null);
+    setAnalysisJobId(null);
     setErrorMessage('');
     setLoadingMessage('');
     setLoadingPercent(0);

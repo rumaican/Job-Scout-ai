@@ -21,6 +21,7 @@ const App: React.FC = () => {
   // App Status State
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'success' | 'error'>('idle');
   const [loadingMessage, setLoadingMessage] = useState<string>('');
+  const [loadingPercent, setLoadingPercent] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string>('');
   
   // Data State
@@ -50,6 +51,7 @@ const App: React.FC = () => {
 
     setStatus('analyzing');
     setLoadingMessage("Uploading CV and initiating scraper...");
+    setLoadingPercent(0);
     setErrorMessage('');
 
     const formData = new FormData();
@@ -57,13 +59,13 @@ const App: React.FC = () => {
     formData.append('searchUrl', searchUrl);
     formData.append('maxJobs', maxJobs.toString());
     formData.append('scoreThreshold', scoreThreshold.toString());
-    
+
     // Pass optional scraper settings
     formData.append('apifyToken', apifyToken);
     formData.append('apifyActor', apifyActor);
 
     try {
-      // Step 1: Analyze
+      // Step 1: Submit job, get jobId
       const response = await fetch(`${API_BASE_URL}/analyze`, {
         method: 'POST',
         body: formData,
@@ -71,12 +73,40 @@ const App: React.FC = () => {
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to analyze jobs');
+        throw new Error(errorData.error || 'Failed to start analysis');
       }
 
-      const result: AnalyzedResponse = await response.json();
-      setData(result);
-      setStatus('success');
+      const { jobId } = await response.json();
+
+      // Step 2: Open SSE stream for real-time progress
+      await new Promise<void>((resolve, reject) => {
+        const es = new EventSource(`${API_BASE_URL}/progress/${jobId}`);
+
+        es.onmessage = (event) => {
+          const payload = JSON.parse(event.data);
+
+          if (payload.type === 'progress') {
+            setLoadingMessage(payload.message || '');
+            if (typeof payload.percent === 'number') {
+              setLoadingPercent(payload.percent);
+            }
+          } else if (payload.type === 'result') {
+            es.close();
+            setData(payload.data as AnalyzedResponse);
+            setStatus('success');
+            resolve();
+          } else if (payload.type === 'error') {
+            es.close();
+            reject(new Error(payload.message || 'An error occurred during analysis.'));
+          }
+        };
+
+        es.onerror = () => {
+          es.close();
+          reject(new Error('Connection to server lost. Ensure the server is running on port 3000.'));
+        };
+      });
+
     } catch (err: any) {
       console.error(err);
       setErrorMessage(err.message || "An unexpected error occurred. Ensure the server is running on port 3000.");
@@ -125,6 +155,7 @@ const App: React.FC = () => {
     setData(null);
     setErrorMessage('');
     setLoadingMessage('');
+    setLoadingPercent(0);
   };
 
   return (
@@ -265,30 +296,42 @@ const App: React.FC = () => {
               {/* Action */}
               <div className="pt-4 border-t border-gray-100 flex flex-col items-center">
                  {status === 'error' && (
-                   <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2 text-sm">
-                     <AlertCircle className="w-4 h-4" />
+                   <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2 text-sm w-full">
+                     <AlertCircle className="w-4 h-4 flex-shrink-0" />
                      {errorMessage}
                    </div>
                  )}
-                 
-                 <button 
-                  type="submit" 
-                  disabled={status === 'analyzing'}
-                  className={`
-                    w-full md:w-auto px-8 py-3 rounded-lg font-semibold text-white shadow-md transition-all
-                    ${status === 'analyzing' ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 hover:shadow-lg'}
-                  `}
-                 >
-                   {status === 'analyzing' ? (
-                     <span className="flex items-center gap-2">
-                       <Loader2 className="w-5 h-5 animate-spin" />
-                       {loadingMessage || 'Processing...'}
-                     </span>
-                   ) : "Scrape & Analyze Jobs"}
-                 </button>
-                 <p className="mt-4 text-xs text-gray-400">
-                   Privacy Notice: Files are processed temporarily for analysis and are not permanently stored.
-                 </p>
+
+                 {status === 'analyzing' ? (
+                   <div className="w-full space-y-3">
+                     <div className="flex items-center gap-3 text-sm text-gray-600">
+                       <Loader2 className="w-4 h-4 animate-spin flex-shrink-0 text-blue-500" />
+                       <span>{loadingMessage || 'Processing...'}</span>
+                       <span className="ml-auto font-medium text-blue-600">{loadingPercent}%</span>
+                     </div>
+                     <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                       <div
+                         className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-out"
+                         style={{ width: `${loadingPercent}%` }}
+                       />
+                     </div>
+                     <p className="text-xs text-gray-400 text-center">
+                       This can take 2–5 minutes depending on the number of jobs.
+                     </p>
+                   </div>
+                 ) : (
+                   <>
+                     <button
+                       type="submit"
+                       className="w-full md:w-auto px-8 py-3 rounded-lg font-semibold text-white shadow-md transition-all bg-blue-600 hover:bg-blue-700 hover:shadow-lg"
+                     >
+                       Scrape &amp; Analyze Jobs
+                     </button>
+                     <p className="mt-4 text-xs text-gray-400">
+                       Privacy Notice: Files are processed temporarily for analysis and are not permanently stored.
+                     </p>
+                   </>
+                 )}
               </div>
             </form>
           </div>
